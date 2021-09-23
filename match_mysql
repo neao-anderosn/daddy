@@ -1,0 +1,1556 @@
+# encoding=utf-8
+import sys
+
+sys.path.append("../")
+import time
+import re
+import Levenshtein
+
+import collections                  # 词频统计库
+import numpy                        # numpy数据处理库
+
+import pymysql
+from pymysql.converters import escape_string
+
+import threading
+from queue import PriorityQueue, Queue
+from DBUtils.PooledDB import PooledDB
+
+import json
+from aliyunsdkcore.client import AcsClient
+from aliyunsdkcore.request import CommonRequest
+from aliyunsdkcore.acs_exception.exceptions import ClientException
+from aliyunsdkcore.acs_exception.exceptions import ServerException
+
+import logging
+
+# import jieba
+# import jieba.posseg as pseg
+# from PIL import Image               # 图像处理库
+# import wordcloud                    # 词云展示库
+# import matplotlib.pyplot as plt     # 图像展示库（这里以plt代表库的全称）
+
+log_name = 'log'+  (time.strftime("%Y%m%d %H%M%S", time.localtime())) + '.log'
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+logging.basicConfig(filename = log_name, level = logging.INFO, format = LOG_FORMAT) 
+
+class MysqlThread(threading.Thread):
+    def __init__(self):
+        super(MysqlThread,self).__init__
+        start_time = time.time()
+        self.pool = self.mysql_connection()
+        print("========= 准备工作完成，共耗时:{}'s =========".format(round(time.time() - start_time, 3)))
+
+    # 数据库连接
+    def mysql_connection(self):
+        maxconnections = 15  # 最大连接数
+        pool = PooledDB(
+            pymysql,
+            maxconnections,
+            host='www.neao.vip',
+            user='root',
+            port=3306,
+            passwd='Neao1590++',
+            db='Daddylab',
+            use_unicode=True)
+        return pool
+    
+    # 数据分组
+    def getData(self,data,n):
+        st = time.time()
+        result = [data[i:i + n] for i in range(0, len(data), n)]
+        print("共获取{}组数据,每组{}个元素.==>> 耗时:{}'s".format(len(result), n, round(time.time() - st, 3)))
+        return result
+
+    # 数据库回滚
+    def mysql_delete(self):
+        st = time.time()
+        con = self.pool.connection()
+        cur = con.cursor()
+        sql = "TRUNCATE TABLE test_table"
+        cur.execute(sql)
+        con.commit()
+        cur.close()
+        con.close()
+        print("清空原数据.==>> 耗时:{}'s".format(round(time.time() - st, 3)))
+        
+    # 开启多线程任务
+    def tasks(self,**kwargs):
+        # 设定最大队列数和线程数
+        q = Queue(maxsize=10)
+        st = time.time()
+        sql =  kwargs.get("S") if "S" in kwargs else False
+        data = kwargs.get("F") if "F" in kwargs else False
+        
+        sql_type = sql[:6].upper()
+        
+        if sql ==False:
+            return None
+
+        results = []
+        COUNT = 0
+        TT =  len(data)
+        tt = 0
+
+        while data:
+            content =data.pop()
+            # print("%s的SQL语句：%s" % (sql_type,sql))
+            # print("参数是：",content)
+            t = threading.Thread(target=self.MySql, kwargs={"S":sql,"F":content,"Q":q})
+            q.put(t)
+            if (q.full() == True) or (len(data)) == 0:
+                thread_list = []
+                while q.empty() == False:
+                    t = q.get()
+                    thread_list.append(t)
+                    t.start()
+                
+                for t in thread_list:
+                    t.join()
+                    tt = tt + 1
+                    print('%d/%d' % (tt,TT),end ='')
+                    result = q.get()
+                    # print("线程返回值:",result)
+                    COUNT = COUNT + result[0]
+                    
+                    for item in result[1]:
+                        results.append(item)
+
+        print("{}完成{}条记录.==>> 耗时:{}'s".format(sql_type,COUNT,round(time.time() - st, 3)))
+        return COUNT,results
+
+    # 单线程执行查询
+    def MySql(self,**kwargs):
+        con = self.pool.connection()
+        cur = con.cursor()
+
+        sql  = kwargs.get("S") if "S" in kwargs else None
+        data = kwargs.get("F") if "F" in kwargs else None
+        q    = kwargs.get("Q") if "Q" in kwargs else None
+        
+        sql_type = sql[:6].upper()
+        # print("%s的SQL语句：%s" % (sql_type,sql))
+        # print("参数是：",data)
+        logging.info("%s的SQL语句：%s" % (sql_type,sql))
+        
+        try:
+            if sql is None:
+                logging.error("查询无SQL语句")
+                print("查询无SQL语句")
+            else:
+                rows =[]
+                COUNT = 0
+                if data is None:
+                    # print("查询语句为：",sql)
+                    count = cur.execute(sql)
+                    COUNT = COUNT + count
+                    con.commit()
+                    rows = cur.fetchall()
+                    # print("查询结果为：",count)
+                else:
+                    if sql_type =="SELECT":
+                        for item in data:
+                            count = cur.execute(sql,item)
+                            COUNT = COUNT + count
+                            row = cur.fetchall()
+                            rows.append(row[0])
+                    else:
+                        count = cur.executemany(sql,data)
+                        COUNT = COUNT + count
+                        con.commit()
+                        # print("多查询下的结果:",rows)
+                        
+                
+                if q is None:
+                    print("单线程%s完成%d条记录" % (sql_type,COUNT))
+                    return COUNT,rows
+                else:
+                    print("多线程%s完成%d条记录" % (sql_type,COUNT))
+                    q.put([COUNT,rows])
+        except Exception as e:
+            con.rollback()  # 事务回滚
+            print('SQL执行有误,原因:', e)
+        finally:
+            cur.close()
+            con.close()
+
+    # 匹配函数
+    def match(self,**kwargs):
+
+        A   = kwargs.get("A") if "A" in kwargs else None
+        B   = kwargs.get("B") if "B" in kwargs else None
+        A_M = kwargs.get("A_M") if "A_M" in kwargs else None
+        B_M = kwargs.get("B_M") if "B_M" in kwargs else None
+        q   = kwargs.get("Q") if "Q" in kwargs else None
+        # print("%d需要匹配%d组" % (len(A),len(B)))
+        result =[]
+
+        i = 0
+        for a in A:
+            i = i + 1
+            j = 0
+
+            
+            for b in B:
+                j = j + 1
+                flag = True
+                for n in range(len(A_M)):
+                    # print("a[A_M[%d]:%s" % (n,a[A_M[n]]))
+                    # print("b[B_M[%d]:%s" % (n,b[B_M[n]]))
+                    # if  Levenshtein.jaro_winkler(a[A_M[n]],b[B_M[n]])==1:
+                    if  a[A_M[n]] != b[B_M[n]]:
+                        # print("名称不匹配，终止匹配")
+                        flag = False
+                        break
+            
+                if flag:
+                    # print("*"*100)
+                    # print("【a】%d:%s:" % (i,a))
+                    # print("\t【b】%d:%s:" % (j,b))
+                    # print("小结果：",(escape_string(b[0]),escape_string(b[1]),b[2],b[3],a[0]))
+                    result.append((escape_string(b[0]),escape_string(b[1]),b[2],b[3],a[0]))
+                    break
+
+            
+        q.put(result)
+
+    # 开启多进程任务匹配
+    def match_tasks(self,**kwargs):
+        
+        # 设定最大队列数和线程数
+        q = Queue(maxsize=10)
+        st = time.time()
+
+        data   = kwargs.get("A") if "A" in kwargs else None
+        B   = kwargs.get("B") if "B" in kwargs else None
+        A_M = kwargs.get("A_M") if "A_M" in kwargs else None
+        B_M = kwargs.get("B_M") if "B_M" in kwargs else None
+
+        if len(A_M) != len(B_M):
+            print("匹配参数错误！")
+            return None
+
+        results = []
+        COUNT = 0
+
+        while data:
+            content =data.pop()
+            # print("%s的SQL语句：%s" % (sql_type,sql))
+            # print("参数是：",content)
+            # print("tttt:",t)
+            t = threading.Thread(target=self.match, kwargs={"A":content,"B":B,"A_M":A_M,"B_M":B_M,"Q":q})
+            q.put(t)
+
+            if (q.full() == True) or (len(data)) == 0:
+                thread_list = []
+                while q.empty() == False:
+                    t = q.get()
+                    print('tttt:',t)
+                    if isinstance (t,threading.Thread):
+                        thread_list.append(t)
+                        t.start()
+
+                for t in thread_list:
+                    t.join()
+                    result = q.get()
+                    print("线程返回值:",result)
+                    for item in result:
+                        COUNT = COUNT + 1 
+                        results.append(item)
+
+        print("{}完成{}条记录.==>> 耗时:{}'s".format("匹配",COUNT,round(time.time() - st, 3)))
+        return COUNT,results
+        
+
+class ALiYun():
+    def __init__(self):
+        self.client = AcsClient(
+        "LTAI5tDLn2459tdB9QgLFjy2",
+        "z2YFCCdmLjpqr4wveEJtCU70neooHn",
+        "cn-hangzhou"
+        )
+    
+    # 提取中心词
+    #https://help.aliyun.com/document_detail/179228.html
+    def GetKeyWord(self,text):
+        client  = self.client
+        request = CommonRequest()
+        request.set_domain('alinlp.cn-hangzhou.aliyuncs.com')
+        request.set_version('2020-06-29')
+        request.add_query_param('ServiceCode', 'alinlp')
+
+        request.set_action_name('GetKeywordChEcom')
+        request.add_query_param('Text',text)
+        # print("text:",text)
+        try:
+            response = client.do_action_with_exception(request)
+            resp_obj = json.loads(response)
+            
+            Data = json.loads(resp_obj['Data'])
+            # print("Data:",Data)
+        
+            result = Data['result'] if Data["success"] else None
+            # print("result:",result)
+
+            output = result['output'] 
+            # print("output:",output)
+            time.sleep(0.01)
+            if output is not None:
+                s =''
+                for i in output:
+                    s = s  + i + '|'
+                print('%s的中心词是:【%s】' % (text,s))
+                return s
+            else:
+                return None
+        except ServerException as e:
+            print(e.get_http_status())
+            print(e.get_error_code())
+            print(e.get_error_msg())
+            return None
+        except ClientException as e:
+            print(e)
+
+    # 智能文本分类（基础版-电商领域）
+    # https://help.aliyun.com/document_detail/185920.html
+    def GetLable(self,text):
+        client  = self.client
+        request = CommonRequest()
+        request.set_domain('alinlp.cn-hangzhou.aliyuncs.com')
+        request.set_version('2020-06-29')
+        request.add_query_param('ServiceCode', 'alinlp')
+
+        request.set_action_name('GetTcChEcom')
+        request.add_query_param('Text',text)
+        print("text:",text)
+        try:
+            response = client.do_action_with_exception(request)
+            resp_obj = json.loads(response)
+            
+            Data = json.loads(resp_obj['Data'])
+            # print("Data:",Data)
+        
+            result = Data['result'] if Data["success"] else None
+            print("result:",result)
+
+            output = result['labelName'] 
+            print("output:",output)
+            time.sleep(0.01)
+            if output is not None:
+                # s =''
+                # for i in output:
+                #     s = s + '|' + i
+                return output
+            else:
+                return None
+        except ServerException as e:
+            print(e.get_http_status())
+            print(e.get_error_code())
+            print(e.get_error_msg())
+            return None
+        except ClientException as e:
+            print(e)
+
+        # 命名实体识别（高级版-中文-可定制）
+        # https://help.aliyun.com/document_detail/200996.html
+    
+    # 中文分词（高级版-电商标题领域-可定制）
+    # https://help.aliyun.com/document_detail/178963.html
+    def CutTitle(self,text):
+        client  = self.client
+        request = CommonRequest()
+        request.set_domain('alinlp.cn-hangzhou.aliyuncs.com')
+        request.set_version('2020-06-29')
+        request.add_query_param('ServiceCode', 'alinlp')
+
+        request.set_action_name('GetWsCustomizedChEcomTitle')
+        request.add_query_param('TokenizerId','MAINSE')
+        request.add_query_param('Text',text)
+        print("text:",text)
+        try:
+            response = client.do_action_with_exception(request)
+            resp_obj = json.loads(response)
+            
+            Data = json.loads(resp_obj['Data'])
+            # print("Data:",Data)
+        
+            result = Data['result'] if Data["success"] else None
+            print("result:",result)
+            time.sleep(0.01)
+            if result is not None:
+                for i in result:
+                    print(i)
+                return result
+            else:
+                return None
+        except ServerException as e:
+            print(e.get_http_status())
+            print(e.get_error_code())
+            print(e.get_error_msg())
+            return None
+        except ClientException as e:
+            print(e)
+
+        # 中文分词（高级版-电商标题领域-可定制）
+        # https://help.aliyun.com/document_detail/178963.html
+    
+    # 命名实体识别（高级版-中文-可定制）
+    # https://help.aliyun.com/document_detail/200996.html
+    def GetEntity(self,text):
+        client  = self.client
+        request = CommonRequest()
+        request.set_domain('alinlp.cn-hangzhou.aliyuncs.com')
+        request.set_version('2020-06-29')
+        request.add_query_param('ServiceCode', 'alinlp')
+
+        request.set_action_name('GetNerCustomizedChEcom')
+        request.add_query_param('LexerId','ECOM')
+        request.add_query_param('Text',text)
+        print("text:",text)
+        try:
+            response = client.do_action_with_exception(request)
+            resp_obj = json.loads(response)
+            
+            Data = json.loads(resp_obj['Data'])
+            # print("Data:",Data)
+        
+            result = Data['result'] if Data["success"] else None
+            print("result:",result)
+            time.sleep(0.01)
+            if result is not None:
+                for i in result:
+                    print(i)
+                return result
+            else:
+                return None
+        except ServerException as e:
+            print(e.get_http_status())
+            print(e.get_error_code())
+            print(e.get_error_msg())
+            return None
+        except ClientException as e:
+            print(e)
+
+    # 文本相似度（高级版-电商领域）
+    # https://help.aliyun.com/document_detail/183850.html
+    def GetSim(self,text1,text2):
+        client  = self.client
+        request = CommonRequest()
+        request.set_domain('alinlp.cn-hangzhou.aliyuncs.com')
+        request.set_version('2020-06-29')
+        request.add_query_param('ServiceCode', 'alinlp')
+
+        request.set_action_name('GetTsChEcom')
+        request.add_query_param('Type','similarity')
+
+        request.add_query_param('OriginT',text1)
+        request.add_query_param('OriginQ',text2)
+
+        print("OriginT:【%s】 VS OriginQ:【%s】" % (text1,text2))
+
+
+        try:
+            response = client.do_action_with_exception(request)
+            resp_obj = json.loads(response)
+            
+            Data = json.loads(resp_obj['Data'])
+            # print("Data:",Data)
+        
+            result = Data['result'] if Data["success"] else None
+            print("result:",result)
+            time.sleep(0.01)
+            if result is not None:
+                sim = float(result[0]['score'])
+                print("SIM:",sim)
+                return sim
+            else:
+                return None
+        except ServerException as e:
+            print(e.get_http_status())
+            print(e.get_error_code())
+            print(e.get_error_msg())
+            return None
+        except ClientException as e:
+            print(e)
+    
+    # 正则表达式数据清理
+    def clean_all(self,item):
+        s = item
+        # 清理括号,会有误伤的情况
+        s = re.sub(r'[【](.*?)[】]', '',s)
+
+        s = re.sub(r'[(](.*?)[)]', '',s)
+        s = re.sub(r'[（](.*?)[）]', '',s)
+
+        s = re.sub(r'[\[](.*?)[\]]', '',s)
+        s = re.sub(r'[{](.*?)[}]', '',s)
+
+        s = re.sub(r'[（](.*?)[)]', '',s)
+        s = re.sub(r'[(](.*?)[）]', '',s)
+
+        s = re.sub(r'【|】|(|)|（|）|{|}|\[|\]', '',s)
+
+
+        # 清理括号
+        # s = re.sub(r'[（(](.*?(发货|预售|直播|群内|用券|赠品|超划算|附赠|联系|特价|优惠券|助理|配赠|参加活动|到货|包邮|限购|买二赠一|再送|赠送|领券|顺丰|勿拍|保质期).*?)[)）]', '',s)   
+        
+        # 清理 老爸
+        s = re.sub(r'(魏){0,1}(老爸)(评测/测评|测评/评测|享测评测|评测享测|评测|享测){0,1}(推荐|力荐|定制){0,1}', '',s)   
+
+        # 替换 开头特殊日期
+        # s = re.sub(r'^(\d{1,2}[ .-]\d{1,2})(.*?)', '\g<2>',s)
+        s = re.sub(r'^(38女王节|女王节|双11|双12|517|518|519|520|618|61|38)', '',s)
+
+        # 清理 发货
+        s = re.sub(r'(\d{1,2}.\d{1,2}|工厂|产地|安徽|单独|保税仓|五常|分月|农场)(发货)', '',s)
+        
+        # 清理 直播
+        s = re.sub(r'[（(](.*?直播.*?)[)）]', '',s)   # 括号内说秒杀
+        s = re.sub(r'(\d{1,2}[ .-/]\d{1,2}|\d\d\d)直播(专享){0,1}(配置){0,1}(秒杀){0,1}', '',s) # 直播带日期
+
+        s = re.sub(r'直播(.*?)(秒杀){0,1}', '',s) # 秒杀带日期
+
+
+        # 清理 预售
+        s = re.sub(r'[\[（(](.*?预售.*?)[)）\]]', '',s)   # 括号内说预售
+        s = re.sub(r'预售\d{1,2}[ .-/]\d{1,2}', '',s) # 预售带日期
+        s = re.sub(r'预售[ -/]', '',s)
+
+        # 清理 秒杀
+        s = re.sub(r'主播疯啦(.*?)1元秒杀(之){0,1}', '',s) 
+        s = re.sub(r'[（(](.*?秒杀.*?)[)）]', '',s)   # 括号内说秒杀
+        s = re.sub(r'(直播){0,1}秒杀', '',s) # 秒杀带日期
+        s = re.sub(r'\d{0,3}(配置){0,1}秒杀', '',s) # 秒杀带日期
+
+
+        # 清理 一口价 
+        s = re.sub(r'全新(.*?)一口价', '',s) 
+
+        # 清理 立减
+        #s = re.sub(r'(领券){0,1}立减(\d){1}(元){0,1}', '',s) 
+
+
+        # 数字段，把 - 替换为 ~ 
+        # s = re.sub(r'(\d[岁月])(-)(\d+)', '\g<1>~\g<3>',s)
+        # s = re.sub(r'(\d+)(-)(\d+)', '\g<1>~\g<3>',s)
+        
+        # 去除单位
+        unit = r'(盒/提|个月|千克|点卷|年级|年|月|日|枚|号|个|包|只|元|粒|岁|抽|支|滴|片|盒|瓶|杯|袋|罐|筒|提|块|根|斤|米|支|箱|mg|kg|KG|ml|IU|cm|CM|mm|MM|m|M|g|G|L){0,1}'
+        s = re.sub(r'(\*|X|/|共|约){0,1}(\s){0}(\d){1}' + unit + r'(装|及以上|以上){0,1}', ' ',s)
+        s = re.sub(r'(/)' + unit + r'(装){0,1}', '',s)
+
+        # 无关字符串、符号替换
+        s = re.sub(r'检测合格|厂家发|专享团购预售|团购|预售|直播|专享|工厂|发货|评测|享测|推荐|全国包邮|包邮|赠品|建议|到期', '',s)
+        s = re.sub(r'\！|\?|\？|\=|\—|\-|\-|\―|\/|\.|\：|\:|\%|\~|', '',s)
+        
+        # 替换空白
+        s = re.sub(r'( ){2}', ' ',s)
+        
+        # 替换开头结尾空白
+        s = re.sub(r'^(\s+)', '',s)
+        s = re.sub(r'$(\s+)', '',s)
+        return(s)
+
+
+def cipin(string_data):
+    # 英文词性转中文词性字典：详细版
+    En2Cn = {
+    'a'    : '形容词',
+        'ad'   : '形容词-副形词',
+        'ag'   : '形容词-形容词性语素',
+        'al'   : '形容词-形容词性惯用语',
+        'an'   : '形容词-名形词',
+    'b'    : '区别词',
+        'bl'   : '区别词-区别词性惯用语',
+    'c'    : '连词',
+        'cc'   : '连词-并列连词',
+    'd'    : '副词',
+        'df'   :'',
+	    'dg'   :'副语素',
+    'e'    : '叹词',
+        'eng'  : '英文',
+    'f'    : '方位词',
+    'g'    : '语素',
+    'h'    : '前缀',
+    'i'    : '成语',
+    'j'    : '简称略语',
+    'k'    : '后缀',
+    'l'    : '习用语',
+    'm'    : '数词',
+        'mg'   : '',
+        'mq'   : '数量词',
+    'n'    : '名词',
+        'ng'   : '名词-名词性语素',
+        'nl'   : '名词-名词性惯用语',
+        'nr'   : '名词-人名',
+            'nrt'  : '',
+            'nr1'  : '名词-汉语姓氏',
+            'nr2'  : '名词-汉语名字',
+            'nrf'  : '名词-音译人名',
+        'nrfg' : '名词-人名',    
+        'nrj'  : '名词-日语人名',
+        'ns'   : '名词-地名',
+        'nsf'  : '名词-音译地名',
+        'nt'   : '名词-机构团体名',
+        'nz'   : '名词-其他专名',
+    'o'    : '拟声词',
+    'p'    : '介词',
+        'pba'  : '介词-“把”',
+        'pbei' : '介词-“被”',
+    'q'    : '量词',
+        'qt'   : '量词-动量词',
+        'qv'   : '量词-时量词',
+    'r'    : '代词',
+        'rg'   : '代词-代词性语素',
+        'rr'   : '代词-人称代词',
+        'rz'   : '代词-指示代词',
+        'rzs'  : '代词-处所指示代词',
+        'rzt'  : '代词-时间指示代词',
+        'rzv'  : '代词-谓词性指示代词',
+        'ry'   : '代词-疑问代词',
+        'rys'  : '代词-处所疑问代词',
+        'ryt'  : '代词-时间疑问代词',
+        'ryv'  : '代词-谓词性疑问代词',
+    's'    : '处所词',
+    't'    : '时间词',
+        'tg'   : '时间词-时间词性语素',
+    'u'    : '助词',
+        'ud'   :'结构助词 得',
+	    'ug'   :'时态助词',
+	    'uj'   :'结构助词 的',
+	    'ul'   :'时态助词 了',
+	    'uv'   :'结构助词 地',
+	    'uz'   :'时态助词 着',
+        'ude1' : '助词-“的”“底”',
+        'ude2' : '助词-“地”',
+        'ude3' : '助词-“得”',
+        'udeng': '助词-“等”“等等”“云云”',
+        'udh'  : '助词-“的话”',
+        'uguo' : '助词-“过”',
+        'ule'  : '助词-“了”“喽”',
+        'ulian': '助词-“连”',
+        'uls'  : '助词-“来讲”“来说”“而言”“说来”',
+        'un'   : '未知词',
+        'usuo' : '助词-“所”',
+        'uyy'  : '助词-“一样”“一般”“似的”“般”',
+        'uzhe' : '助词-“着”',
+        'uzhi' : '助词-“之”',
+    'v'    : '动词',
+        'vd'   : '动词-副动词',
+        'vf'   : '动词-趋向动词',
+        'vg'   : '动词-动词性语素',
+        'vi'   : '动词-不及物动词（内动词）',
+        'vl'   : '动词-动词性惯用语',
+        'vn'   : '动词-名动词',
+        'vshi' : '动词-“是”',
+        'vx'   : '动词-形式动词',
+        'vyou' : '动词-“有”',
+    'w'    : '标点符号',
+        'wb'   : '标点符号-百分号千分号，全角：％ ‰ 半角：%',
+        'wd'   : '标点符号-逗号，全角：， 半角：,',
+        'wf'   : '标点符号-分号，全角：； 半角： ; ',
+        'wj'   : '标点符号-句号，全角：。',
+        'wh'   : '标点符号-单位符号，全角：￥ ＄ ￡ ° ℃ 半角 $',
+        'wkz'  : '标点符号-左括号，全角：（ 〔 ［ ｛ 《 【 〖 〈 半角：( [ { <',
+        'wky'  : '标点符号-右括号，全角：） 〕 ］ ｝ 》 】 〗 〉 半角： ) ] { >',
+        'wm'   : '标点符号-冒号，全角：： 半角： :',
+        'wn'   : '标点符号-顿号，全角：、',
+        'wp'   : '标点符号-破折号，全角：—— －－ ——－ 半角：—',
+        'ws'   : '标点符号-省略号，全角：…… …',
+        'wt'   : '标点符号-叹号，全角：！ 半角：!',
+        'ww'   : '标点符号-问号，全角：？ 半角：?',
+        'wyz'  : '标点符号-左引号，全角：“ ‘ 『',
+        'wyy'  : '标点符号-右引号，全角：” ’ 』',
+    'x'    : '字符串',
+        'xu'   : '字符串-网址URL',
+        'xx'   : '字符串-非语素字',
+    'y'    : '语气词',
+    'z'    : '状态词',
+    'zg'   : '状态词',
+    }
+
+    StopWords = 'StopWords.txt'            # 停用词库
+    Output = '词频.txt'                   # 输出文件
+    background = 'background.png'           # 词频背景
+    number = 100                       # 统计个数
+  
+    # 预处理
+    # 定义正则表达式匹配模式（空格等）
+    pattern = re.compile(u'\t|\n|\.|-|:|;|\)|\(|\?|"|（|）|【|】') 
+    # 将符合模式的字符去除
+    string_data = re.sub(pattern, '', string_data) 
+    jieba.load_userdict("userdict.txt")
+    
+    # 文本分词，精确模式分词+HMM
+    seg_list_exact = jieba.cut(string_data, cut_all=False, HMM=True)
+    object_list = []
+    
+    # 去除停用词（去掉一些意义不大的词，如标点符号、嗯、啊等）
+    with open(StopWords, 'r', encoding='UTF-8') as meaninglessFile:
+        stopwords = set(meaninglessFile.read().split('\n'))
+    stopwords.add(' ')
+
+    for word in seg_list_exact:         # 循环读出每个分词
+        if word not in stopwords:       # 如果不在去除词库中
+            object_list.append(word)    # 分词追加到列表
+    
+    # 词频统计
+    word_counts = collections.Counter(object_list)       # 对分词做词频统计
+    word_counts_top = word_counts.most_common(number)    # 获取前number个最高频的词
+
+    # 输出至工作台，并导出“词频.txt”文件
+    print ('\n词语\t词频\t词性')
+    print ('——————————')
+    fileOut = open(Output,'w',encoding='UTF-8')     # 创建文本文件；若已存在，则进行覆盖
+    fileOut.write('词语\t词频\t词性\n')
+    fileOut.write('——————————\n')
+    count = 0
+    for TopWord,Frequency in word_counts_top:                       # 获取词语和词频
+        for POS in jieba.posseg.cut(TopWord):                       # 获取词性
+            if count == number:
+                break
+            print(TopWord + '\t',str(Frequency) + '\t',list(En2Cn.values())[list(En2Cn.keys()).index(POS.flag)])                    # 逐行输出数据
+            fileOut.write(TopWord + '\t' + str(Frequency) + '\t' + list(En2Cn.values())[list(En2Cn.keys()).index(POS.flag)] + '\n') # 逐行写入str格式数据
+            count += 1
+    fileOut.close()                                                 # 关闭文件
+
+    # 词频展示
+    print ('\n开始制作词云……')                    # 提示当前状态
+    mask = numpy.array(Image.open(background))      # 定义词频背景
+    wc = wordcloud.WordCloud(
+        font_path = 'C:/Windows/Fonts/simfang.ttf', # 设置字体（这里选择“仿宋”）
+        background_color='white',                   # 背景颜色
+        mask = mask,                                # 文字颜色+形状（有mask参数再设定宽高是无效的）
+        max_words = number,                         # 显示词数
+        max_font_size = 150                         # 最大字号
+    )
+
+    wc.generate_from_frequencies(word_counts)                                        # 从字典生成词云
+    # wc.recolor(color_func=wordcloud.ImageColorGenerator(mask))                       # 将词云颜色设置为背景图方案
+    plt.figure('词云')                                                               # 弹框名称与大小
+    # plt.subplots_adjust(top=0.99,bottom=0.01,right=0.99,left=0.01,hspace=0,wspace=0) # 调整边距
+    plt.imshow(wc, cmap=plt.cm.gray, interpolation='bilinear')                       # 处理词云
+    plt.axis('off')                                                                  # 关闭坐标轴
+    print ('制作完成！')                                                             # 提示当前状态
+    plt.show() 
+
+
+def SIM(str1,str2):
+    if str1 =='' or str2=='' or str1 == None or str2 == None:
+        return 0
+    else:
+        return Levenshtein.jaro_winkler(str1 , str2)
+
+if __name__ == '__main__':
+
+    t = MysqlThread()
+    A = ALiYun()
+
+    logging.info("debug log")
+    start_time = time.time()
+    
+    
+    # 测试
+    enable_flag = 0
+    while(enable_flag):
+        enable_flag = 0
+        sql_select = "SELECT ID,Sname FROM temp" 
+        (count,result_select) = t.MySql(S = sql_select)
+
+        data = []
+        for item in result_select:
+            ID = item[0]
+            Sname = item[1]*3
+            data.append((Sname,ID))
+            
+
+        result = t.getData(data,100)
+
+        sql = "UPDATE temp SET Sname = %s WHERE  ID = %s"
+        R,S = t.tasks(S = sql,F = result)
+        print(R,S)
+    
+    
+    # 获取阿里云中心词
+    enable_flag = 0
+    while(enable_flag):
+        enable_flag = 0
+        # sql_select = "SELECT BI_name FROM GOOD_LIST WHERE KeyWord is null GROUP BY BI_name"
+        sql_select = "SELECT Sname FROM GOOD_LIST WHERE KeyWord is null GROUP BY Sname LIMIT 3000"    
+        (COUNT,result_select) = t.MySql(S = sql_select)
+        print("查询到%d条记录" % COUNT)
+        i = 0
+        data = []
+        for item in result_select:
+            i = i + 1
+            print("%d/%d" % (i,COUNT),end ='')
+            name = item[0]
+            
+            if len(name)<40 and len(name)>0:
+                KeyWord = A.GetKeyWord(name)
+                time.sleep(0.01)
+                if KeyWord is not None:
+                    logging.info(str(name)+":"+KeyWord)
+                    data.append((escape_string(KeyWord),escape_string(name)))
+     
+        result = t.getData(data,100)
+
+        sql = "UPDATE GOOD_LIST SET KeyWord = %s WHERE Sname = %s"
+        t.tasks(S = sql,F = result)
+    
+    # 获取阿里云分类
+    enable_flag = 0
+    while(enable_flag):
+        enable_flag = 0
+        sql_select = "SELECT BI_name,Sname FROM GOOD_LIST WHERE KeyWord IS NULL and (Sname is not null or Sname <>'') GROUP BY BI_name,Sname ORDER BY Sname DESC limit 1000"    
+        result_all = t.mysql_select(S=sql_select)
+        # print(result_all)
+        print("剩余%d记录没有匹配" % len(result_all))
+
+        sql = "UPDATE GOOD_LIST SET Lable = %s WHERE BI_name = %s"
+        data = []
+        for item in result_all:
+            BI_name = escape_string(item[0])
+            Sname = item[1]
+            # KeyWord = A.GetKeyWord(Sname)
+            Lable = A.GetLable(Sname)
+            data.append((Lable,BI_name))
+        
+        result = t.getData(data,100)
+        print("分组结果：",result)
+        t.task_update(sql,result)
+
+    # 名称简化
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT ID, BI_name FROM GOOD_LIST WHERE Sname IS NULL or Sname =''"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+
+        i = 0
+        data = []
+        for item in result_select_all_to_update:
+            i = i + 1
+            print('%d/%d' % (i,COUNT))
+            ID = item[0]
+            BI_name = item[1]
+            Sname = A.clean_all(BI_name)
+
+            data.append((Sname,ID))
+        
+        result = t.getData(data,1000)
+        # print("分组结果：",result)
+        
+        sql_update = "UPDATE GOOD_LIST SET Sname = %s WHERE ID = %s"
+        R,S = t.tasks(S = sql_update,F = result)
+        
+
+    # 手工名称 匹配 数仓导出
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+        sql_select_all_to_update = "SELECT name_original,manual FROM name4simplify WHERE (manual IS NOT NULL)"    
+        (count,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (count))
+        
+        data = []
+        for item in result_select_all_to_update:
+            name_original = escape_string(str(item[0]))
+            manual = escape_string(str(item[1]))
+            data.append((manual,name_original))
+        # print("查询条件构建:",data)
+
+        
+        result = t.getData(data,10)
+        # print("分组结果：",result)
+        
+        sql = "UPDATE GOOD_LIST SET Mname = %s WHERE BI_name = %s"
+        R,S = t.tasks(S = sql,F = result)
+
+######################################################################
+
+    # 新增商品
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+        sql_select_all_to_insert = "SELECT BI_name, BI_type ,BI_sku,BATCH FROM need2add"    
+        (COUNT,result_select_all_to_insert) = t.MySql(S=sql_select_all_to_insert)
+
+        sql = "SELECT Uname,Utype,Usku,Uspu,BI_sku,BI_type FROM GOOD_LIST WHERE  Usku is not null and (BI_type is not null and BI_type <>'') and (BI_sku is not null and BI_sku <>'')"
+        (count,result) = t.MySql(S = sql)
+
+        print("有%d条记录用于匹配" % (COUNT))
+        data = []
+        i = 0
+        for item1 in result_select_all_to_insert:
+            i = i +1
+            print('%d/%d' % (i,COUNT))
+            BI_name = item[0]
+            BI_type = item[1]
+            BI_sku =  item[2]
+            BATCH = item[3]
+            
+
+
+        result = t.getData(data,100)
+        # print("分组结果：",result)
+        
+        sql = "UPDATE GOOD_LIST SET Uname = %s, Utype = %s, Usku = %s, Uspu = %s, remark = '表内 SPU+规格 匹配SKU' WHERE  ID = %s"
+        R,S = t.tasks(S = sql,F = result)
+# 注意事项：
+# 1.BI_sku和BI_type 需要把空值和'null'转为 NULL
+
+######################################################################
+    # 以 匹配 组合商品
+    enable_flag = 1
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT DISTINCT COMB_code,Usku,Uspu,COMB_type FROM COMB"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+        
+        sql_select_ERP = "SELECT Uname,Utype,Usku,Uspu FROM ERP"    
+        (count,result_select_ERP) = t.MySql(S=sql_select_ERP)
+
+        i = 0
+        data = []
+        for item in result_select_all_to_update:
+            i = i + 1
+            print('%d/%d' % (i,COUNT))
+
+            COMB_code = item[0]
+            Usku1 = item[1]
+            Uspu1 = item[2]
+            COMB_type = item[3]
+            data.append((COMB_type,COMB_code))
+
+            for item2 in result_select_ERP:
+                Uname = item2[0]
+                Utype = item2[1]
+                Usku = item2[2]
+                Uspu = item2[3]
+                
+                if COMB_type == '数量组合' and Usku == Usku1:
+                    data.append((COMB_code,COMB_type,escape_string(Uname),escape_string(Utype),Usku,Uspu,COMB_code))
+                    break
+
+                if COMB_type == '同品组合' and Uspu == Uspu1:
+                    data.append((COMB_code,COMB_type,escape_string(Uname),'','',Uspu,COMB_code))
+                    break
+
+                if COMB_type == '跨品组合':
+                    data.append((COMB_code,COMB_type,'','','','',COMB_code))
+                    break
+
+
+        result = t.getData(data,50)
+        
+        # sql_update = "UPDATE GOOD_LIST SET COMB = %s, BI_sku = type_code, \
+        #     remark = '00 以type_code匹配组合商品' \
+        #     WHERE (COMB = '' and type_code = %s)"
+        # R,S = t.tasks(S = sql_update,F = result)
+
+        sql_update = "UPDATE GOOD_LIST SET COMB = %s, BI_sku = sku_code, \
+        remark = '00 以sku_code匹配组合商品' \
+        WHERE (COMB = '' and sku_code = %s)"
+        R,S = t.tasks(S = sql_update,F = result)
+
+
+    # 以 SKU 匹配 ERP的SKU
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT Uname,Utype,Usku,Uspu,ERP_sku FROM ERP WHERE ERP_sku <>''"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+        
+        i = 0
+        data = []
+        for item in result_select_all_to_update:
+            i = i + 1
+            print('%d/%d' % (i,COUNT))
+
+            Uname = item[0]
+            Utype = item[1]
+            Usku = item[2]
+            Uspu = item[3]
+            ERP_sku = item[4]
+
+            data.append((escape_string(Uname),escape_string(Utype),Usku,Uspu,ERP_sku))
+        
+        result = t.getData(data,50)
+        
+        sql_update = "UPDATE GOOD_LIST SET Uname = %s, Utype = %s, Usku = %s, Uspu = %s, \
+            remark = '01 以 SKU 匹配 ERP的SKU' \
+            WHERE(COMB = '' and Usku ='' and BI_sku = %s)"
+        R,S = t.tasks(S = sql_update,F = result)
+
+
+    # 以 SKU 匹配 新老转换表的SKU
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT Uname,Utype,Usku,Uspu,Osku FROM TRANS WHERE (Osku <>'')"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+        
+        i = 0
+        data = []
+        for item in result_select_all_to_update:
+            i = i + 1
+            print('%d/%d' % (i,COUNT))
+
+            Uname = item[0]
+            Utype = item[1]
+            Usku = item[2]
+            Uspu = item[3]
+            Osku = item[4]
+
+            data.append((escape_string(Uname),escape_string(Utype),Usku,Uspu,Osku))
+        
+        result = t.getData(data,100)
+        
+        sql_update = "UPDATE GOOD_LIST SET Uname = %s, Utype = %s, Usku = %s, Uspu = %s, \
+            remark = '02 以 SKU 匹配 新老转换表的SKU' \
+            WHERE(COMB = '' and Usku ='' and BI_sku = %s)"
+        R,S = t.tasks(S = sql_update,F = result)
+
+
+    # 以 SKU 匹配 网店管家的SKU
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT Uname,Utype,Usku,Uspu, WDGJ_sku FROM WDGJ WHERE (WDGJ_sku IS NOT NULL and WDGJ_sku <>'' and remark in ('手工修改','下架商品'))"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+        
+        i = 0
+        data = []
+        for item in result_select_all_to_update:
+            i = i + 1
+            print('%d/%d' % (i,COUNT))
+
+            Uname = item[0]
+            Utype = item[1]
+            Usku = item[2]
+            Uspu = item[3]
+            WDGJ_sku = item[4]
+
+
+            data.append((escape_string(Uname),escape_string(Utype),Usku,Uspu,WDGJ_sku))
+        
+        result = t.getData(data,100)
+        
+        sql_update = "UPDATE GOOD_LIST SET Uname = %s, Utype = %s, Usku = %s, Uspu = %s, \
+            remark = '03 以 SKU 匹配 网店管家的SKU' \
+            WHERE (COMB = '' and Usku ='' and BI_sku = %s)"
+        R,S = t.tasks(S = sql_update,F = result)
+
+#######################################################################
+
+    # 表内 SPU+规格 匹配SKU，效果不好，弃用。
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT ID,BI_sku,BI_type FROM GOOD_LIST WHERE (Uname IS NULL) and (BI_type is not null and BI_type <>'') and (BI_sku is not null and BI_sku <>'')"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+
+        sql = "SELECT Uname,Utype,Usku,Uspu,BI_sku,BI_type FROM GOOD_LIST WHERE  (Usku is not null) and (BI_type is not null and BI_type <>'') and (BI_sku is not null and BI_sku <>'')"
+        (count,result) = t.MySql(S = sql)
+
+        i = 0
+        FINISH = 0
+        data = []
+        for item1 in result_select_all_to_update:
+            i = i +1
+            print('%d/%d-%d' % (i,COUNT,FINISH))
+
+            ID = item1[0]
+            BI_sku1 = item1[1]
+            if len(BI_sku1)<8:
+                break
+            BI_spu1 = BI_sku1[0:8]
+            BI_type1 = item1[2]
+        
+            for item in result:
+                Uname = item[0]
+                Utype = item[1]
+                Usku = item[2]
+                Uspu = item[3]
+
+                BI_sku = item[4]
+                BI_spu = BI_sku[0:8]
+                BI_type = item[5]
+
+                if BI_spu1 == BI_spu and BI_type1 == BI_type:
+                    print((Uname,Utype,Usku,Uspu,ID))
+                    data.append((escape_string(Uname),escape_string(Utype),Usku,Uspu,ID))
+                    FINISH = FINISH + 1
+                    break
+
+        result = t.getData(data,100)
+        
+        sql_update = "UPDATE GOOD_LIST SET Uname = %s, Utype = %s, Usku = %s, Uspu = %s, remark = '表内 SPU+规格 匹配SKU' WHERE  ID = %s"
+        R,S = t.tasks(S = sql_update,F = result)
+
+
+    # 表内 名称+规格 匹配SKU
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT ID,BI_name,BI_type FROM GOOD_LIST WHERE (Usku IS NULL) and (BI_type is not null)"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+
+        sql = "SELECT Uname,Utype,Usku,Uspu,BI_name,BI_type FROM GOOD_LIST WHERE  (Usku is not null) and (BI_type is not null)"
+        (count,result) = t.MySql(S = sql)
+
+        i = 0 
+        data = []
+        FINISH = 0
+        for item1 in result_select_all_to_update:
+            i = i +1
+            print('%d/%d-%d' % (i,COUNT,FINISH))
+
+            ID1 = item1[0]
+            BI_name1 = item1[1]
+            BI_type1 = item1[2]
+            
+            for item in result:
+                Uname = item[0]
+                Utype = item[1]
+                Usku = item[2]
+                Uspu = item[3]
+
+                BI_name = item[4]
+                BI_type = item[5]
+
+                if BI_name1 == BI_name and BI_type1.replace('：',':') == BI_type.replace('：',':'):
+                    print((Uname,Utype,Usku,Uspu,ID1))
+                    data.append((escape_string(Uname),escape_string(Utype),Usku,Uspu,ID1))
+                    FINISH = FINISH + 1
+                    break
+
+        result = t.getData(data,100)
+        
+        sql_update = "UPDATE GOOD_LIST SET Uname = %s, Utype = %s, Usku = %s, Uspu = %s, remark = '04 表内 名称+规格 匹配SKU' WHERE  ID = %s"
+        R,S = t.tasks(S = sql_update,F = result)
+
+
+# 表内 名称+规格相似(0.9) 匹配SKU
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT ID,BI_name,BI_type FROM GOOD_LIST WHERE (Usku IS NULL) and (BI_type is not null)"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+
+        sql = "SELECT Uname,Utype,Usku,Uspu,BI_name,BI_type FROM GOOD_LIST WHERE  (Usku is not null) and (BI_type is not null)"
+        (count,result) = t.MySql(S = sql)
+
+        i = 0 
+        data = []
+        FINISH = 0
+        for item1 in result_select_all_to_update:
+            i = i +1
+            print('%d/%d-%d' % (i,COUNT,FINISH))
+
+            ID1 = item1[0]
+            BI_name1 = item1[1]
+            BI_type1 = item1[2]
+            
+            for item in result:
+                Uname = item[0]
+                Utype = item[1]
+                Usku = item[2]
+                Uspu = item[3]
+
+                BI_name = item[4]
+                BI_type = item[5]
+
+                if BI_name1 == BI_name and SIM(BI_type1,BI_type) >0.90:
+                    print((Uname,Utype,Usku,Uspu,ID1))
+                    data.append((escape_string(Uname),escape_string(Utype),Usku,Uspu,ID1))
+                    FINISH = FINISH + 1
+                    break
+
+        result = t.getData(data,100)
+        
+        sql_update = "UPDATE GOOD_LIST SET Uname = %s, Utype = %s, Usku = %s, Uspu = %s, remark = '05 表内 名称+规格相似(0.9) 匹配SKU' WHERE  ID = %s"
+        R,S = t.tasks(S = sql_update,F = result)
+
+
+#######################################################################
+
+    # 表内 SPU 匹配SPU
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT ID,BI_sku FROM GOOD_LIST WHERE (Uname IS NULL) and (BI_sku is not null and BI_sku <>'')"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+
+        sql = "SELECT Uname,Uspu,BI_sku FROM GOOD_LIST WHERE  (Uspu is not null) and (BI_sku is not null and BI_sku <>'')"
+        (count,result) = t.MySql(S = sql)
+
+        i = 0
+        FINISH = 0
+        data = []
+        for item1 in result_select_all_to_update:
+            i = i +1
+            print('%d/%d-%d' % (i,COUNT,FINISH))
+
+            ID = item1[0]
+            BI_sku1 = item1[1]
+
+            if len(BI_sku1)<8:
+                break
+            
+            BI_spu1 =BI_sku1[0:8]
+
+            for item in result:
+                Uname = item[0]
+                Uspu = item[1]
+                BI_sku = item[2]
+                BI_spu = BI_sku[0:8]
+
+                if BI_spu1 == BI_spu:
+                    print((Uname,Uspu,ID))
+                    data.append((escape_string(Uname),Uspu,ID))
+                    FINISH = FINISH + 1
+                    break
+
+        result = t.getData(data,100)
+        
+        sql_update = "UPDATE GOOD_LIST SET Uname = %s, Uspu = %s, remark = '表内 SPU 匹配SPU' WHERE  ID = %s"
+        R,S = t.tasks(S = sql_update,F = result)
+
+
+    # 表内 名称 匹配SPU
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        sql_select_all_to_update = "SELECT ID,BI_name FROM GOOD_LIST WHERE (Uname IS NULL)"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+        
+        sql = "SELECT Uname,Uspu,BI_name FROM GOOD_LIST WHERE  (Uspu is not null)"
+        (count,result) = t.MySql(S = sql)
+
+        i = 0 
+        FINISH = 0
+        data = []
+        for item1 in result_select_all_to_update:
+            i = i +1
+            print('%d/%d-%d' % (i,COUNT,FINISH))
+
+            ID1 = item1[0]
+            BI_name1 = item1[1]
+            
+            for item in result:
+                Uname = item[0]
+                Uspu = item[1]
+                BI_name = item[2]
+
+                if BI_name1 == BI_name:
+                    print((Uname,Uspu,ID1))
+                    data.append((escape_string(Uname),Uspu,ID1))
+                    FINISH = FINISH + 1
+                    break
+
+        result = t.getData(data,100)
+        # print("分组结果：",result)
+        
+        sql_update = "UPDATE GOOD_LIST SET Uname = %s,Uspu = %s, remark = '表内 名称 匹配SPU' WHERE  ID = %s"
+        R,S = t.tasks(S = sql_update,F = result)
+
+    # 表内 名称相似 匹配SPU
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        level = 0.8
+        sql_select_all_to_update = "SELECT ID,Sname FROM GOOD_LIST WHERE (Uname IS NULL)"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+        
+        sql = "SELECT Uname,Uspu,Sname FROM GOOD_LIST WHERE  (Uspu is not null)"
+        (count,result) = t.MySql(S = sql)
+
+        i = 0 
+        FINISH = 0
+        data = []
+        for item1 in result_select_all_to_update:
+            i = i +1
+            print('%d/%d-%d' % (i,COUNT,FINISH))
+
+            ID1 = item1[0]
+            Sname1 = item1[1]
+            
+            Uname = ''
+            Uspu = ''
+            Sname = ''
+            SIM = level
+
+            flag = False
+
+            for item in result:
+                tUname = item[0]
+                tUspu = item[1]
+                tSname = item[2]
+
+                tSIM = Levenshtein.jaro_winkler(Sname1 , tSname)
+
+                if tSIM >= SIM:
+                    Uname = tUname
+                    Uspu = tUspu
+                    Sname = tSname
+                    SIM = tSIM
+                    flag = True
+            
+            if flag:
+                print("【%s】VS【%s】相似度:%f，返回:" % (Sname1,Sname,SIM),end='')
+                print((Uname,Uspu,ID1))
+                FINISH = FINISH + 1
+                data.append((escape_string(Uname),Uspu,SIM,ID1))
+
+        result = t.getData(data,100)
+        
+        sql_update = "UPDATE GOOD_LIST SET Uname = %s,Uspu = %s, SIM=%s, remark = '表内 名称相似(0.8) 匹配SPU' WHERE  ID = %s"
+        R,S = t.tasks(S = sql_update,F = result)
+
+#######################################################################
+
+# 名称相似度计算
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+
+        level = 0.8
+        sql_select_all_to_update = "SELECT distinct BI_name,Uname FROM GOOD_LIST WHERE SIM IS NULL AND Uname is not null"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于校验" % (COUNT))
+        
+        i = 0 
+        FINISH = 0
+        data = []
+        for item1 in result_select_all_to_update:
+            i = i +1
+            print('%d/%d-%d' % (i,COUNT,FINISH))
+
+            BI_name = item1[0]
+            Uname = item1[1]
+            SIM = Levenshtein.jaro_winkler(BI_name , Uname)
+
+            print("【%s】VS【%s】相似度:%f，返回:" % (BI_name, Uname,SIM),end='')
+            print((SIM,BI_name, Uname))
+            FINISH = FINISH + 1
+
+            data.append((SIM,escape_string(BI_name),escape_string(Uname)))
+
+        result = t.getData(data,10)
+        
+        sql_update = "UPDATE GOOD_LIST SET SIM = %s WHERE  BI_name = %s AND Uname = %s"
+        R,S = t.tasks(S = sql_update,F = result)
+
+  
+        
+    
+    
+    
+    
+    
+    
+    # 表内以名称和规格进行匹配2
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+        sql_select_all_to_update = "SELECT ID,BI_name,BI_type FROM GOOD_LIST WHERE (Usku IS NULL OR Usku = '') and (BI_type is not null and BI_type <>'')" 
+        sql_select_all_to_update = "SELECT ID,BI_name,BI_type FROM GOOD_LIST limit 5000" 
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        
+        sql = "SELECT Uname,Utype,Usku,Uspu,BI_name,BI_type FROM GOOD_LIST WHERE  Usku is not null and (BI_type is not null and BI_type <>'')"
+        (count,result) = t.MySql(S = sql)
+
+        print("有%d条记录用于匹配" % (COUNT))
+        data = t.getData(result_select_all_to_update,10)
+
+        C,data2 = t.match_tasks(A = data,B = result,A_M = (1,2),B_M = (4,5))
+        print(C)
+       
+
+
+        result = t.getData(data2,100)
+        print("分组结果：",result)
+        
+        # sql = "UPDATE GOOD_LIST SET Uname = %s, Utype = %s, Usku = %s, Uspu = %s, remark = '表内名称匹配' WHERE  ID = %s"
+        # R,S = t.tasks(S = sql,F = result)
+
+    # 表内以名称相似（0.9）和规格相似（0.9）进行SKU匹配
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+        level = 0.9
+        sql_select_all_to_update = "SELECT ID,BI_name,BI_type,Mname FROM GOOD_LIST WHERE (Usku IS NULL OR Usku = '') and (BI_type is not null and BI_type <>'') and Mname is not null"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+        data = []
+        i =  0 
+        for item in result_select_all_to_update:
+            i = i +1
+            print('%d/%d' % (i,COUNT),end="")
+            ID = item[0]
+            BI_name = (str(item[1]))
+            BI_type = (str(item[2]))
+            Mname = (str(item[3]))
+
+            sql = "SELECT Uname,Utype,Usku,Uspu,BI_name,BI_type FROM GOOD_LIST WHERE  Usku is not null and BI_name is not null and BI_type is not null and Mname = '%s'" % (Mname) 
+            sql = "SELECT Uname,Utype,Usku,Uspu,BI_name,BI_type FROM GOOD_LIST WHERE  Usku is not null and BI_name is not null and BI_type is not null " 
+            
+            (count,result) = t.MySql(S = sql)
+
+            if count >0:
+                SIM = level
+                Uname = ''
+                Utype = ''
+                Usku = ''
+                Uspu = ''
+                BI_name1 = ''
+                BI_type1 = ''
+                flag = False
+                SIM1 = 0
+                SIM2 = 0
+
+                for item in result:
+                    tUname = str(item[0])
+                    tUtype = str(item[1])
+                    tUsku = str(item[2])
+                    tUspu = str(item[3])
+                    tBI_name1 = str(item[4])
+                    tBI_type1 = str(item[5])
+
+                    tSIM1 = Levenshtein.jaro_winkler(BI_name , tBI_name1)
+                    tSIM2 = Levenshtein.jaro_winkler(BI_type , tBI_type1)
+                    sim = tSIM1*0.6+tSIM2*0.4
+
+                    if SIM1 >= level and SIM2 >= level and sim >=SIM:
+                        print((tSIM1,tSIM2,sim))
+                        SIM = sim
+                        SIM1 = tSIM1
+                        SIM2 = tSIM2
+                        Uname = tUname
+                        Utype = tUtype
+                        Usku = tUsku
+                        Uspu = tUspu
+                        BI_name1 = tBI_name1
+                        BI_type1 = tBI_type1
+                        flag = True
+
+                if flag:
+                    print((BI_name,BI_type),"=>",end="")
+                    print((SIM1,SIM2),"=>",end="")
+                    print((BI_name1,BI_type1),"=>",end="")
+                    print((Uname,Utype,Usku,Uspu,ID))
+                    logging.info((Uname,Utype,Usku,Uspu,ID))
+                    Uname = escape_string(Uname)
+                    Utype = escape_string(Utype)
+                    remark = '表内名称、规格相似匹配（名称:%.3f/规格:%.3f）' % (SIM1,SIM2)
+                    data.append((Uname,Utype,Usku,Uspu,remark,ID))
+
+        result = t.getData(data,100)
+        # print("分组结果：",result)
+        
+        sql = "UPDATE GOOD_LIST SET Uname = %s,Utype = %s ,Usku = %s, Uspu = %s, remark = %s WHERE  ID = %s"
+        R,S = t.tasks(S = sql,F = result)
+
+    # 表内以名称相似（0.95）进行SPU匹配
+    enable_flag = 0
+    while(enable_flag): 
+        enable_flag = 0
+        level = 0.99
+
+        sql_select_all_to_update = "SELECT ID,BI_name,Sname FROM GOOD_LIST WHERE (Uspu IS NULL OR Uspu = '')"    
+        (COUNT,result_select_all_to_update) = t.MySql(S=sql_select_all_to_update)
+        print("有%d条记录用于匹配" % (COUNT))
+
+        sql = "SELECT Uname,Uspu,BI_name,Sname FROM GOOD_LIST WHERE  Uspu is not null and Sname is not null" 
+        (count,result) = t.MySql(S = sql)
+
+        data = []
+        i =  0 
+        for item1 in result_select_all_to_update:
+            i = i +1
+            print('%d/%d' % (i,COUNT))
+            ID = item1[0]
+            BI_name1 = (str(item1[1]))
+            Sname1 = (str(item1[2]))
+
+            if count >0:
+                Uname = ''
+                Uspu = ''
+                BI_name = ''
+                Sname = ''
+                SIM =  level
+                flag = False
+
+                for item in result:
+                    tUname = str(item[0])
+                    tUspu = str(item[1])
+                    tBI_name = str(item[2])
+                    tSname = str(item[3])
+
+                    tSIM = Levenshtein.jaro_winkler(Sname1 , tSname)
+
+                    if tSIM >=SIM:
+                        SIM = tSIM
+                        Uname = tUname
+                        Uspu = tUspu
+                        BI_name = tBI_name
+                        Sname = tSname
+                        flag = True
+
+                if flag:
+                    s = "【%s=>%s】VS【%s=>%s】,相似度%f，返回值为：(%s,%s)" % (BI_name1,Sname1,BI_name,Sname,SIM,Uname,Uspu)
+                    print(s)
+                    logging.info((Uname,Uspu,SIM,ID))
+
+                    Uname = escape_string(Uname)
+                    remark = '表内简化名称【%s】相似（%.3f）匹配SPU' % (Sname,SIM)
+                    remark = escape_string(remark)
+
+                    data.append((Uname,Uspu,SIM,remark,ID))
+
+        result = t.getData(data,100)
+        # print("分组结果：",result)
+        
+        sql = "UPDATE GOOD_LIST SET Uname = %s, Uspu = %s, SIM = %s, remark = %s WHERE  ID = %s"
+        R,S = t.tasks(S = sql,F = result)
+
+
+
+    # cipin(string_data)
+
+    # c1 = jieba.cut(str1, cut_all=False)
+    # logging.info("c1:"+ '/'.join(list(c1)))
+
+    # c2 = jieba.cut(str2, cut_all=False)
+    # logging.info("c2:"+ '/'.join(list(c2)))
+
+    # c1F = jieba.cut(str1, HMM=False)
+    # logging.info("c1F:"+ '/'.join(list(c1F)))
+
+    # c2F = jieba.cut(str2, HMM=False)
+    # logging.info("c2F:"+ '/'.join(list(c2F)))
+    print("========= 全部完成，共耗时:{}'s =========".format(round(time.time() - start_time, 3)))
