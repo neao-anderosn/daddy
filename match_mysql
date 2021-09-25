@@ -1102,7 +1102,7 @@ if __name__ == '__main__':
         R,S = t.tasks(S = sql_update,F = result)
 
 
-    # 表内 名称+规格 匹配SKU
+    # 04 表内 名称+规格 匹配SKU
     enable_flag = 0
     while(enable_flag): 
         enable_flag = 0
